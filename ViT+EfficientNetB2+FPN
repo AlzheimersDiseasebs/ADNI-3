@@ -1,0 +1,180 @@
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D, Input, Conv2D, UpSampling2D, Add, Layer
+from tensorflow.keras.optimizers import Adam
+from sklearn.model_selection import StratifiedShuffleSplit
+import matplotlib.pyplot as plt
+from tensorflow.keras.applications import EfficientNetB2
+from tensorflow.keras.models import Model
+from tensorflow.keras.metrics import AUC, BinaryAccuracy, Precision, Recall
+
+# Veri setini yükleyin
+images = np.load("resized_images_LMCIEMCI_SSIM.npy")
+labels = np.load("data_label_LMCIEMCI_SSIM.npy")
+
+# Veriyi (224, 224, 3) boyutlarına yeniden şekillendirin
+images = np.array([np.resize(img, (224, 224, 3)) for img in images])
+
+# Etiketleri kategorik formata dönüştürün
+labels = to_categorical(labels - 1, 5)
+
+# Veriyi normalize edin
+#images = images.astype('float32') / 255.0
+
+# 10 katlı çapraz doğrulama için bölmek
+kfold = StratifiedShuffleSplit(n_splits=10, random_state=42)
+fold_accuracies = []
+
+# Custom ResizeLayer to handle resizing inside the Keras functional API
+class ResizeLayer(Layer):
+    def __init__(self, target_shape, **kwargs):
+        super(ResizeLayer, self).__init__(**kwargs)
+        self.target_shape = target_shape
+
+    def call(self, inputs):
+        return tf.image.resize(inputs, self.target_shape)
+
+# FPN Bloğu
+def build_fpn_feature_pyramid(base_model):
+    # EfficientNetB2'den özellik haritalarını al
+    x1 = base_model.get_layer('block1a_activation').output  # (56, 56, 32)
+    x2 = base_model.get_layer('block2a_activation').output  # (28, 28, 48)
+    x3 = base_model.get_layer('block3a_activation').output  # (14, 14, 136)
+    x4 = base_model.get_layer('block4a_activation').output  # (7, 7, 384)
+    x5 = base_model.get_layer('block6a_activation').output  # (7, 7, 768)
+
+    # FPN bloklarını tanımla
+    p5 = Conv2D(256, (1, 1), padding='same', activation='relu')(x5)
+
+    p4 = Conv2D(256, (1, 1), padding='same', activation='relu')(x4)
+    p5_resized = UpSampling2D(size=(2, 2))(p5)  # (14, 14, 256)
+    p4 = Add()([p4, p5_resized])
+
+    p3 = Conv2D(256, (1, 1), padding='same', activation='relu')(x3)
+    p4_resized = UpSampling2D(size=(2, 2))(p4)  # (28, 28, 256)
+    p3 = Add()([p3, p4_resized])
+
+    p2 = Conv2D(256, (1, 1), padding='same', activation='relu')(x2)
+    p3_resized = UpSampling2D(size=(2, 2))(p3)  # (56, 56, 256)
+    p2 = Add()([p2, p3_resized])
+
+    p1 = Conv2D(256, (1, 1), padding='same', activation='relu')(x1)
+    p2_resized = UpSampling2D(size=(2, 2))(p2)  # (112, 112, 256)
+    p1 = Add()([p1, p2_resized])
+
+    return p1
+
+# MLP ile ViT Bloğu
+class ViTWithMLP(tf.keras.Model):
+    def __init__(self, num_classes, embedding_size, num_heads, ff_dim, dropout_rate=0.001):
+        super(ViTWithMLP, self).__init__()
+
+        self.embedding = tf.keras.layers.Conv1D(embedding_size, kernel_size=1, strides=1, padding="valid")
+        self.pos_embedding = tf.keras.layers.Embedding(input_dim=196, output_dim=embedding_size)  # 14x14=196
+        self.dropout = Dropout(dropout_rate)
+
+        self.transformer_encoder = tf.keras.layers.MultiHeadAttention(num_heads=num_heads, key_dim=embedding_size)
+        self.layer_norm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.ffn = tf.keras.Sequential([
+            Dense(ff_dim, activation="relu"),
+            Dense(embedding_size),
+        ])
+        self.layer_norm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.global_avg_pooling = tf.keras.layers.GlobalAveragePooling1D()
+
+        # MLP Katmanları
+        self.mlp = tf.keras.Sequential([
+            Dense(512, activation='relu'),
+            Dense(256, activation='relu'),
+            Dense(num_classes, activation='softmax')
+        ])
+
+    def call(self, inputs):
+        # Girdi boyutunu genişletin
+        if len(inputs.shape) == 2:  # (batch_size, embedding_dim) -> (batch_size, 1, embedding_dim)
+            inputs = tf.expand_dims(inputs, axis=1)
+
+        positions = tf.range(start=0, limit=inputs.shape[1], delta=1)
+        positions = self.pos_embedding(positions)
+        x = self.embedding(inputs)
+        x += positions
+        x = self.dropout(x)
+
+        x = self.transformer_encoder(x, x)
+        x = self.layer_norm1(x + x)
+
+        x = self.ffn(x)
+        x = self.layer_norm2(x + x)
+
+        x = self.global_avg_pooling(x)
+        x = self.mlp(x)
+        return x
+
+# 10 katlı çapraz doğrulama döngüsü
+for train_index, test_index in kfold.split(images, np.argmax(labels, axis=1)):
+    X_train, X_test = images[train_index], images[test_index]
+    y_train, y_test = labels[train_index], labels[test_index]
+
+    # EfficientNetB2 modelini yükleyin
+    efficientNet = EfficientNetB2(weights=None, include_top=False, input_shape=(224, 224, 3))
+
+    # FPN özelliğini oluştur
+    fpn_features = build_fpn_feature_pyramid(efficientNet)
+
+    # FPN'den gelen özellikleri Vision Transformer'a bağlamak için global ortalama havuzlama kullanın
+    fpn_pooled = GlobalAveragePooling2D()(fpn_features)
+
+    # Vision Transformer modeli ile MLP
+    vit_model = ViTWithMLP(num_classes=5, embedding_size=128, num_heads=8, ff_dim=128, dropout_rate=0.001)
+
+    # Vision Transformer'a FPN özelliklerini verin
+    vit_output = vit_model(fpn_pooled)
+
+    # Son modeli tanımlayın
+    model = Model(inputs=efficientNet.input, outputs=vit_output)
+
+    # Modeli derleyin
+    model.compile(optimizer=Adam(), loss='categorical_crossentropy', metrics=[AUC(), BinaryAccuracy(), Precision(), Recall()])
+
+    # Eğitim sırasında accuracy değerlerini kaydetmek için bir callback fonksiyonu oluşturun
+    class AccuracyCallback(tf.keras.callbacks.Callback):
+        def __init__(self):
+            super(AccuracyCallback, self).__init__()
+            self.train_accuracies = []
+
+        def on_epoch_end(self, epoch, logs=None):
+            train_acc = logs.get('binary_accuracy')
+            print(f'Training Accuracy for Epoch {epoch + 1}: {train_acc}')
+            self.train_accuracies.append(train_acc)
+
+    accuracy_callback = AccuracyCallback()
+
+    # Modeli eğitin
+    history = model.fit(X_train, y_train, epochs=10, batch_size=128, validation_data=(X_test, y_test), callbacks=[accuracy_callback])
+
+    fold_accuracies.append(accuracy_callback.train_accuracies)  # Her bir kat için accuracy değerlerini kaydedin
+
+# Tüm katmanların accuracy değerlerini birleştirin
+all_accuracies = np.mean(np.array(fold_accuracies), axis=0)
+
+# Eğitim sırasında accuracy değerlerini gösteren bir grafik oluşturun
+plt.plot(range(1, len(all_accuracies) + 1), all_accuracies, label='Average Accuracy')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy')
+plt.title('Accuracy Over Epochs for All Folds')
+plt.legend()
+plt.show()
+
+# Her bir fold için accuracy değerlerini gösteren bir grafik oluşturun
+for i, fold_accuracy in zip(range(1, 11), fold_accuracies):
+    plt.plot(range(1, len(fold_accuracy) + 1), fold_accuracy, label=f'Fold {i}')
+
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy')
+plt.title('Accuracy Over Epochs for All Folds')
+plt.legend()
+plt.show()
+
+
+
