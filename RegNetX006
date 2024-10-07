@@ -1,0 +1,87 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.layers import Dense, Dropout, LayerNormalization, Input, GlobalAveragePooling2D, BatchNormalization
+from tensorflow.keras.optimizers import Adam
+from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.applications.inception_v3 import InceptionV3
+from tensorflow.keras.metrics import AUC, BinaryAccuracy, Precision, Recall
+from tensorflow.keras.models import Model
+from tensorflow.keras.applications.regnet import RegNetX006
+
+# Veri setini yükleyin
+images = np.load("resized_images_SSIM.npy")
+labels = np.load("data_label_SSIM.npy")
+
+# Etiketleri kategorik formata dönüştürün
+labels = to_categorical(labels - 1, 5)
+
+# Veriyi standartlaştırın (normalize edin)
+scaler = StandardScaler()
+images = scaler.fit_transform(images.reshape(-1, images.shape[-1])).reshape(images.shape)
+
+# Giriş verisini şekillendirin
+images = np.expand_dims(images, axis=-1)  # Tek kanallı görüntüleri RGB formatına genişletme
+images = np.repeat(images, 3, axis=-1)    # Tek kanallı verileri üç kanala kopyalama
+
+# 10 katlı çapraz doğrulama için bölmek
+kfold = StratifiedShuffleSplit(n_splits=10, random_state=42)
+fold_accuracies = []
+
+
+# Accuracy değerlerini kaydetmek için bir callback fonksiyonu oluşturun
+class AccuracyCallback(tf.keras.callbacks.Callback):
+    def __init__(self):
+        super(AccuracyCallback, self).__init__()
+        self.train_accuracies = []
+
+    def on_epoch_end(self, epoch, logs=None):
+        train_acc = logs.get('binary_accuracy')
+        print(f'Training Accuracy for Epoch {epoch + 1}: {train_acc}')
+        self.train_accuracies.append(train_acc)
+
+# 10 katlı çapraz doğrulama döngüsü
+for train_index, test_index in kfold.split(images, labels):
+    X_train, X_test = images[train_index], images[test_index]
+    y_train, y_test = labels[train_index], labels[test_index]
+    # Modeli oluşturun
+    #input_tensor = Input(shape=(224, 224, 3))
+    base_model = RegNetX006(include_top=False, weights=None, input_shape=(224, 224, 3))
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(1024, activation='relu')(x)
+    predictions = Dense(5, activation='softmax')(x)
+    model = Model(inputs=base_model.input, outputs=predictions)
+
+    # Modeli derleyin
+    model.compile(optimizer=Adam(), loss='categorical_crossentropy', metrics=[AUC(), BinaryAccuracy(), Precision(), Recall()])
+    accuracy_callback = AccuracyCallback()  # AccuracyCallback sınıfından bir nesne oluşturun
+
+    # Modeli eğitin
+    model.fit(X_train, y_train, epochs=10, batch_size=32, callbacks=[accuracy_callback])
+
+    fold_accuracies.append(accuracy_callback.train_accuracies)  # Her bir kategori için accuracy değerlerini ayrı ayrı kaydedin
+
+# Tüm katmanların accuracy değerlerini birleştirin
+all_accuracies = np.mean(np.array(fold_accuracies), axis=0)
+
+# Eğitim sırasında accuracy değerlerini gösteren bir grafik oluşturun
+plt.plot(range(1, len(all_accuracies) + 1), all_accuracies, label='Average Accuracy')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy')
+plt.title('Accuracy Over Epochs for All Folds')
+plt.legend()
+plt.show()
+
+# Her bir fold için accuracy değerlerini gösteren bir grafik oluşturun
+for i, fold_accuracy in zip(range(1, 11), fold_accuracies):
+    plt.plot(range(1, len(fold_accuracy) + 1), fold_accuracy, label=f'Fold {i}')
+
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy')
+plt.title('Accuracy Over Epochs for All Folds')
+plt.legend()
+plt.show()
+
