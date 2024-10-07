@@ -1,0 +1,46 @@
+import numpy as np
+from PIL import Image
+import os
+
+def dcm_to_png(input_folder, output_folder):
+    converted_count = 0  # Başlangıçta dönüştürülen dosya sayısını sıfıra ayarlayın
+
+    # Eğer çıktı klasörü yoksa oluştur
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    # Klasördeki tüm dosyaları al
+    for root, dirs, files in os.walk(input_folder):
+        for file in files:
+            if file.endswith(".dcm"):
+                dcm_path = os.path.join(root, file)
+                # Dicom dosyasını aç
+                ds = pydicom.dcmread(dcm_path)
+
+                # Dicom görüntüsünü normalize et ve uint8 veri tipine dönüştür
+                img = ds.pixel_array.astype(np.float32)  # Convert to float32 for calculations
+                if len(img.shape) == 3:  # Check if multi-channel (shouldn't be)
+                    img = img[:, :, 0]  # Extract first channel (assuming grayscale)
+                img_scaled = (np.maximum(img, 0) / img.max()) * 255.0
+                img_scaled = np.uint8(img_scaled)  # Convert to uint8 for image data
+
+                # Dönüştürülmüş görüntüyü Pillow Image formatına dönüştür
+                img_pil = Image.fromarray(img_scaled, mode="L")  # Specify grayscale mode
+
+                # Dosyayı .png olarak kaydet
+                output_path = os.path.join(output_folder, file[:-4] + ".png")
+                img_pil.save(output_path)
+
+                converted_count += 1  # Her bir dönüştürme işlemi tamamlandığında sayacı artır
+
+    return converted_count  # Dönüştürülen dosya sayısını geri döndür
+# Klasörlerin yollarını tanımla
+input_folder = "/content/drive/MyDrive/AXIAL"
+output_folder = "/content/drive/MyDrive/AXIALPNGSS"
+
+# Dönüşümü gerçekleştir ve dönüştürülen dosya sayısını al
+converted_count = dcm_to_png(input_folder, output_folder)
+print(f"{converted_count} görüntü dönüştürüldü.")
+
+
+
