@@ -1,5 +1,9 @@
-ADNI-3 Data Set is included.
+The ADNI-3 Data Set is included.
 
-Images can be resized after downloading. Then the classification labels in the CSV file need to be matched with the images.
+The images in the dataset with the .DCM extension can be resized and converted to PNG by adjusting them to the size of the model that needs to be run.
 
-After matching the dataset with the CSV file, the models were run using 10 fold cross validation. And slice selection was made.
+The classification labels in the CSV file then need to be matched to the images.
+
+After the dataset was matched with the CSV file, the models were run using 10-fold cross validation. And slice selection was done. Structural Similarity Index Measure (SSIM) was used for slice selection. And 5 images were selected with this method. 
+
+On the selected images, both the ready-made models were tested and the newly developed models were run. If desired, new models can be tested and run on the dataset.
